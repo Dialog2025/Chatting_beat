@@ -1,0 +1,15 @@
+[Unit]
+Description=Chat Server
+After=network.target
+
+[Service]
+# 按实际上传位置和用户名修改下面两行
+WorkingDirectory=/opt/chat_server
+User=chat
+ExecStart=/usr/bin/python3 -u /opt/chat_server/chat_server.py
+Environment=PYTHONIOENCODING=utf-8
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
