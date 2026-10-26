@@ -2,5 +2,6 @@
   "host": "47.98.222.74",
   "port": 8080,
   "username": "偷喝一杯日落",
-  "password": "123"
+  "password": "123",
+  "theme": "dark"
 }

@@ -28,6 +28,9 @@ CLIENT_ZIP = os.path.join(BASE_DIR, "chat_client.zip")
 
 MAX_FRAME_SIZE = 32 * 1024 * 1024  # 客户端单文件上限 8MB，加密+base64 后远小于此值
 LOGIN_TIMEOUT = 30
+# 客户端每 20s 发一次 ping；发过 ping 的连接若这么久没任何数据，视为死连接清理掉，
+# 否则发给它的消息会被写进死连接、误标为"已送达"而丢失
+HEARTBEAT_TIMEOUT = 75
 RECENT_LIMIT = 20
 MAX_NAME_LEN = 32
 
@@ -72,6 +75,17 @@ def load_emoji_pack(emoji_dir: str) -> dict:
 
 def valid_name(name) -> bool:
     return isinstance(name, str) and 0 < len(name) <= MAX_NAME_LEN and name.isprintable() and name.strip() == name
+
+
+def enable_keepalive(sock: socket.socket) -> None:
+    """TCP 保活兜底：对端掉电/断网时由内核探测出死连接（Linux 参数，其他系统只开开关）。"""
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        for name, value in (("TCP_KEEPIDLE", 60), ("TCP_KEEPINTVL", 10), ("TCP_KEEPCNT", 3)):
+            if hasattr(socket, name):
+                sock.setsockopt(socket.IPPROTO_TCP, getattr(socket, name), value)
+    except OSError:
+        pass
 
 
 class AccountStore:
@@ -282,6 +296,7 @@ class ChatServer:
         self.online_clients = {}  # username -> (conn, send_lock)
         self.clients_lock = threading.Lock()
         self.handlers = {
+            "ping": self._handle_ping,
             "msg": self._handle_chat_msg,
             "typing": self._relay_typing,
             "search_users": self._handle_search,
@@ -337,6 +352,7 @@ class ChatServer:
 
     def _handle_client(self, raw_conn: socket.socket, addr) -> None:
         raw_conn.settimeout(LOGIN_TIMEOUT)
+        enable_keepalive(raw_conn)
         try:
             conn = self.ssl_context.wrap_socket(raw_conn, server_side=True)
         except (ssl.SSLError, OSError):
@@ -380,6 +396,11 @@ class ChatServer:
                 self.online_clients[username] = (conn, threading.Lock())
             if old is not None:
                 try:
+                    with old[1]:
+                        send_msg(old[0], {"type": "kicked"})  # 让旧客户端知道是被顶号，不要自动重连
+                except OSError:
+                    pass
+                try:
                     old[0].shutdown(socket.SHUT_RDWR)  # 发 FIN 让旧客户端正常感知断开，而不是收到 RST
                     old[0].close()
                 except OSError:
@@ -393,6 +414,8 @@ class ChatServer:
                     if data is None:
                         break
                 handler = self.handlers.get(data.get("type"))
+                if data.get("type") == "ping":
+                    conn.settimeout(HEARTBEAT_TIMEOUT)  # 只对会发心跳的新客户端启用，旧客户端空闲不受影响
                 if handler is not None:
                     handler(username, data)
                 data = None
@@ -477,10 +500,20 @@ class ChatServer:
         if self.social.are_friends(sender, target):
             self._send(target, {"type": "typing", "from": sender, "state": bool(data.get("state"))})
 
+    def _handle_ping(self, username: str, data: dict) -> None:
+        self._send(username, {"type": "pong"})
+
     def _handle_chat_msg(self, sender: str, data: dict) -> None:
         msg_id = data.get("msg_id")
         if not isinstance(msg_id, str) or not 0 < len(msg_id) <= 64:
             msg_id = str(uuid.uuid4())
+        # 客户端断线重连后会用同一 msg_id 补发未确认的消息，已收过的只回 ack 不重复存
+        existing = self.messages.query(lambda r: r["id"] == msg_id)
+        if existing:
+            if existing[0]["from"] == sender:
+                status = "delivered" if existing[0]["delivered"] else "stored"
+                self._send(sender, {"type": "msg_ack", "msg_id": msg_id, "status": status})
+            return
         recipient = data.get("to", "")
         ciphertext = data.get("ciphertext", "")
         if not isinstance(ciphertext, str) or not self.social.are_friends(sender, recipient):
@@ -574,13 +607,20 @@ class ChatServer:
             self._broadcast_group(group, "group_update")
 
     def _handle_group_msg(self, sender: str, data: dict) -> None:
-        group = self.social.get_group(str(data.get("group_id", "")))
-        ciphertext = data.get("ciphertext", "")
-        if group is None or sender not in group["members"] or not isinstance(ciphertext, str):
-            return
         msg_id = data.get("msg_id")
         if not isinstance(msg_id, str) or not 0 < len(msg_id) <= 64:
             msg_id = str(uuid.uuid4())
+        # 客户端断线重连后会用同一 msg_id 补发未确认的群消息，已收过的只回 ack 不重复转发
+        existing = self.group_messages.query(lambda r: r["id"] == msg_id)
+        if existing:
+            if existing[0]["from"] == sender:
+                self._send(sender, {"type": "group_msg_ack", "msg_id": msg_id, "status": "sent"})
+            return
+        group = self.social.get_group(str(data.get("group_id", "")))
+        ciphertext = data.get("ciphertext", "")
+        if group is None or sender not in group["members"] or not isinstance(ciphertext, str):
+            self._send(sender, {"type": "group_msg_ack", "msg_id": msg_id, "status": "not_member"})
+            return
 
         record = {
             "id": msg_id,
@@ -598,6 +638,7 @@ class ChatServer:
         sent = [m for m in group["members"] if m != sender and self._send(m, incoming)]
         if sent:
             self.group_messages.update([msg_id], lambda r: r["delivered_to"].extend(sent))
+        self._send(sender, {"type": "group_msg_ack", "msg_id": msg_id, "status": "sent"})
 
 
 def main() -> None:

@@ -1,6 +1,7 @@
 """局域网聊天客户端：登录窗口 + 好友列表 + 单独聊天窗口，Tkinter GUI。"""
 import base64
 import ctypes
+import ctypes.wintypes
 import io
 import json
 import os
@@ -21,6 +22,7 @@ from chat_common import CHAT_PASSPHRASE, DEFAULT_PORT, create_client_ssl_context
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 LOGIN_CONFIG_FILE = os.path.join(BASE_DIR, "login_config.json")
+WINDOW_CONFIG_FILE = os.path.join(BASE_DIR, "window_config.json")
 EMOJI_CACHE_DIR = os.path.join(BASE_DIR, "emoji_cache")
 MAX_FILE_SIZE = 8 * 1024 * 1024  # 单个文件/图片最大 8MB
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp"}
@@ -29,6 +31,11 @@ TYPING_REPEAT_SEC = 2.0    # 持续敲字时重发通知的最小间隔
 TYPING_IDLE_MS = 3000      # 停手这么久后告知对方已结束输入
 TYPING_EXPIRE_MS = 8000    # 收不到后续通知时自动收起提示，防止掉包卡住
 AI_SENDER = "AI"  # 服务器保留发送者名，用于识别 AI 回复气泡
+# 空闲连接会被路由器/防火墙/云 NAT 悄悄回收且两端都收不到通知，需定时心跳保活并检测死连接
+HEARTBEAT_INTERVAL_MS = 20_000
+HEARTBEAT_TIMEOUT_SEC = 60  # 服务器支持 pong 时，超过这么久没收到任何数据就判定连接已死
+RECONNECT_DELAYS_SEC = (1, 3, 5, 10, 30)
+DISCONNECTED_SUFFIX = "（连接断开，正在重连...）"
 
 
 class _FlashInfo(ctypes.Structure):
@@ -59,6 +66,37 @@ if _user32 is not None:
     _user32.GetAncestor.argtypes = [ctypes.c_void_p, ctypes.c_uint]
     _user32.GetForegroundWindow.restype = ctypes.c_void_p
     _user32.FlashWindowEx.argtypes = [ctypes.POINTER(_FlashInfo)]
+
+
+class _MonitorInfo(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", ctypes.c_uint),
+        ("rcMonitor", ctypes.wintypes.RECT),
+        ("rcWork", ctypes.wintypes.RECT),
+        ("dwFlags", ctypes.c_uint),
+    ]
+
+
+_MONITOR_DEFAULTTONEAREST = 2
+if _user32 is not None:
+    _user32.MonitorFromPoint.restype = ctypes.c_void_p
+    _user32.MonitorFromPoint.argtypes = [ctypes.wintypes.POINT, ctypes.c_uint]
+    _user32.GetMonitorInfoW.argtypes = [ctypes.c_void_p, ctypes.POINTER(_MonitorInfo)]
+
+
+def monitor_work_area(win, x: int, y: int) -> tuple:
+    """返回包含点 (x, y) 的显示器工作区 (left, top, right, bottom)，多屏时坐标可为负。"""
+    if _user32 is not None:
+        try:
+            hmon = _user32.MonitorFromPoint(ctypes.wintypes.POINT(int(x), int(y)), _MONITOR_DEFAULTTONEAREST)
+            info = _MonitorInfo()
+            info.cbSize = ctypes.sizeof(_MonitorInfo)
+            if hmon and _user32.GetMonitorInfoW(hmon, ctypes.byref(info)):
+                rc = info.rcWork
+                return rc.left, rc.top, rc.right, rc.bottom
+        except (OSError, ctypes.ArgumentError):
+            pass
+    return 0, 0, win.winfo_screenwidth(), win.winfo_screenheight()
 
 
 def flash_window(win) -> None:
@@ -270,14 +308,21 @@ def hide_until_ready(win) -> None:
 
 
 def place_beside(win, parent, gap: int = 8) -> None:
-    """把弹窗贴在父窗口左侧，左边放不下就改放右侧，并保证不越出屏幕。"""
+    """把弹窗贴在父窗口右侧，右边放不下就改放左侧，并保证不越出屏幕。"""
     win.update_idletasks()
+    parent.update_idletasks()
     width, height = win.winfo_reqwidth(), win.winfo_reqheight()
-    x = parent.winfo_rootx() - gap - width
-    if x < 0:
-        x = parent.winfo_rootx() + parent.winfo_width() + gap
-    x = max(0, min(x, win.winfo_screenwidth() - width))
-    y = max(0, min(parent.winfo_rooty(), win.winfo_screenheight() - height))
+    # geometry 的 +x+y 是外框坐标，宽度却是客户区宽度，需补上左右边框
+    border = max(0, parent.winfo_rootx() - parent.winfo_x())
+    outer_w = width + 2 * border
+    left, top, right, bottom = monitor_work_area(
+        parent, parent.winfo_x() + parent.winfo_width() // 2, parent.winfo_y() + parent.winfo_height() // 2,
+    )
+    x = parent.winfo_x() + parent.winfo_width() + 2 * border + gap
+    if x + outer_w > right:
+        x = parent.winfo_x() - gap - outer_w
+    x = max(left, min(x, right - outer_w))
+    y = max(top, min(parent.winfo_y(), bottom - height))
     win.geometry(f"{width}x{height}+{x}+{y}")
 
 
@@ -529,6 +574,62 @@ def _write_login_config(data: dict) -> None:
         pass
 
 
+def load_window_config() -> dict:
+    try:
+        with open(WINDOW_CONFIG_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def window_center(win) -> tuple:
+    return win.winfo_x() + win.winfo_width() // 2, win.winfo_y() + win.winfo_height() // 2
+
+
+def remember_window(kind: str, win) -> None:
+    """记录窗口大小（按 kind 区分好友/聊天窗口）和共用的窗口中心点。"""
+    try:
+        if not win.winfo_viewable():
+            return
+        data = load_window_config()
+        data[kind] = {"width": win.winfo_width(), "height": win.winfo_height()}
+        data.pop("x", None)
+        data.pop("y", None)
+        data["cx"], data["cy"] = window_center(win)
+        with open(WINDOW_CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+    except (tk.TclError, OSError):
+        pass
+
+
+def restore_window(kind: str, win, center=None) -> None:
+    """按配置恢复窗口大小，并把窗口中心对齐到 center（未指定时用上次保存的中心）。"""
+    data = load_window_config()
+    win.update_idletasks()
+    # 隐藏中的窗口 winfo_width 可能是 1，从已设定的 geometry 字符串取尺寸更可靠
+    width, height = (int(v) for v in win.geometry().split("+")[0].split("x"))
+    if width <= 1 or height <= 1:
+        width, height = win.winfo_reqwidth(), win.winfo_reqheight()
+    try:
+        size = data.get(kind) or {}
+        if int(size["width"]) > 1 and int(size["height"]) > 1:
+            width, height = int(size["width"]), int(size["height"])
+    except (KeyError, TypeError, ValueError):
+        pass
+    geometry = f"{width}x{height}"
+    try:
+        cx, cy = center if center is not None else (int(data["cx"]), int(data["cy"]))
+        # 只在中心点所在的显示器内收敛，左侧副屏的负坐标不能被当成越界
+        left, top, right, bottom = monitor_work_area(win, cx, cy)
+        x = max(left, min(cx - width // 2, right - width))
+        y = max(top, min(cy - height // 2, bottom - height))
+        geometry += f"+{x}+{y}"
+    except (KeyError, TypeError, ValueError):
+        pass
+    win.geometry(geometry)
+
+
 def friends_file(username: str) -> str:
     return os.path.join(BASE_DIR, f"friends_{username}.json")
 
@@ -604,6 +705,62 @@ def format_size(num_bytes: int) -> str:
             return f"{int(size)}{unit}" if unit == "B" else f"{size:.1f}{unit}"
         size /= 1024
     return f"{size:.1f}MB"
+
+
+class LoginError(Exception):
+    """服务器明确拒绝登录（如密码错误），重试也没用。"""
+
+
+def enable_keepalive(sock: socket.socket) -> None:
+    """开启 TCP 保活，作为应用层心跳之外的兜底。"""
+    try:
+        if hasattr(socket, "SIO_KEEPALIVE_VALS"):
+            sock.ioctl(socket.SIO_KEEPALIVE_VALS, (1, 30_000, 5_000))
+        else:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    except (OSError, AttributeError, ValueError):
+        pass
+
+
+def connect_and_login(host: str, port: int, username: str, password: str, invite_code: str = ""):
+    """建立 TLS 连接并登录，返回 (sock, login_ok 响应)。
+
+    网络问题抛 OSError（含 ssl.SSLError），服务器拒绝抛 LoginError。
+    """
+    raw_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    raw_sock.settimeout(5)
+    try:
+        raw_sock.connect((host, port))
+        enable_keepalive(raw_sock)
+        sock = create_client_ssl_context().wrap_socket(raw_sock, server_hostname=host)
+    except BaseException:
+        raw_sock.close()
+        raise
+    try:
+        send_msg(sock, {
+            "type": "login", "username": username, "password": password,
+            "invite_code": invite_code,
+        })
+        response = recv_msg(sock)
+        if response is None:
+            raise OSError("服务器无响应")
+        if response.get("type") == "login_fail":
+            raise LoginError(response.get("reason", "登录失败"))
+        if response.get("type") != "login_ok":
+            raise LoginError("登录响应异常")
+        # 服务器在 login_ok 后会等一条消息，必须发出去，否则会被当作超时断开
+        try:
+            send_msg(sock, {"type": "get_emoji_pack"})
+            emoji_resp = recv_msg(sock)
+            if emoji_resp and emoji_resp.get("type") == "emoji_pack":
+                sync_emoji_cache(emoji_resp.get("files", {}))
+        except OSError:
+            pass
+    except BaseException:
+        sock.close()
+        raise
+    sock.settimeout(None)
+    return sock, response
 
 
 class LoginWindow:
@@ -686,15 +843,7 @@ class LoginWindow:
 
     def _login_worker(self, host, port, username, password, invite_code):
         try:
-            raw_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            raw_sock.settimeout(5)
-            raw_sock.connect((host, port))
-            sock = create_client_ssl_context().wrap_socket(raw_sock, server_hostname=host)
-            send_msg(sock, {
-                "type": "login", "username": username, "password": password,
-                "invite_code": invite_code,
-            })
-            response = recv_msg(sock)
+            sock, response = connect_and_login(host, port, username, password, invite_code)
         except FileNotFoundError:
             self.root.after(0, self._login_failed, "缺少 server.crt 证书文件，请向服务器管理员索取")
             return
@@ -704,27 +853,9 @@ class LoginWindow:
         except OSError as exc:
             self.root.after(0, self._login_failed, f"连接失败: {exc}")
             return
-
-        if response is None:
-            self.root.after(0, self._login_failed, "服务器无响应")
+        except LoginError as exc:
+            self.root.after(0, self._login_failed, str(exc))
             return
-        if response.get("type") == "login_fail":
-            self.root.after(0, self._login_failed, response.get("reason", "登录失败"))
-            sock.close()
-            return
-        if response.get("type") != "login_ok":
-            self.root.after(0, self._login_failed, "登录响应异常")
-            sock.close()
-            return
-
-        try:
-            send_msg(sock, {"type": "get_emoji_pack"})
-            emoji_resp = recv_msg(sock)
-            if emoji_resp and emoji_resp.get("type") == "emoji_pack":
-                sync_emoji_cache(emoji_resp.get("files", {}))
-        except OSError:
-            pass
-        sock.settimeout(None)
 
         self.root.after(
             0, self._login_success, sock, username, response.get("history", []),
@@ -742,27 +873,41 @@ class LoginWindow:
         save_login_config(host, port, username, password)
         self.root.destroy()
         friends_root = tk.Tk()
-        FriendsWindow(friends_root, sock, username, history, recent, groups, group_history, group_recent, broadcasts, friends, friend_requests)
+        FriendsWindow(
+            friends_root, sock, username, history, recent, groups, group_history, group_recent,
+            broadcasts, friends, friend_requests, login_info=(host, port, password),
+        )
         friends_root.mainloop()
 
 
 class FriendsWindow:
     """好友列表主界面：好友申请/同意、未读数量提示、点击进入聊天、群聊管理。"""
 
-    def __init__(self, root, sock, username, history, recent, groups=None, group_history=None, group_recent=None, broadcasts=None, friends=None, friend_requests=None):
+    def __init__(self, root, sock, username, history, recent, groups=None, group_history=None, group_recent=None, broadcasts=None, friends=None, friend_requests=None, login_info=None):
         self.root = root
         self.sock = sock
         self.username = username
+        self.login_info = login_info  # (host, port, password)，断线后自动重连用
+        self.connected = True
+        self._closing = False
+        self._sock_gen = 0  # 每次换新连接自增，用来忽略旧连接收尾时发来的事件
+        self._last_recv = time.monotonic()
+        self._server_pongs = False  # 旧版服务器不回 pong，此时只靠发送失败来发现断线
+        self._reconnect_attempt = 0
 
         # 服务器为好友关系的权威数据源，登录时下发的列表直接覆盖本地缓存
         self.friends = list(friends) if friends is not None else load_friends(username)
         save_friends(username, self.friends)
         self.unread = {}
+        self._unread_order = []  # ("friend", 名字) / ("group", 群id)，越靠后越新
         self.chat_logs = {}
         self.open_chats = {}
         self.pending_ids = {}
+        self.pending_wire = {}  # msg_id -> 原始报文，重连后用同一个 msg_id 补发，服务器据此去重
+        self.pending_group_ids = {}  # msg_id -> group_id，等待 group_msg_ack
         self.incoming_queue = queue.Queue()
         self.active_search_dialog = None
+        self.request_dialogs = {}
 
         self.groups = {g["id"]: g for g in (groups or [])}
         self.group_chat_logs = {}
@@ -771,11 +916,13 @@ class FriendsWindow:
         self._group_order = []
 
         hide_until_ready(root)
-        root.title(f"好友列表 - {username}")
+        self.base_title = f"好友列表 - {username}"
+        root.title(self.base_title)
         root.protocol("WM_DELETE_WINDOW", self.on_close)
         apply_theme(root)
         register_themed_window(root, self._on_theme_change)
         self.scaler = WindowScaler(root, 300, 420)
+        restore_window("friends", root)
         self.ui_font = self.scaler.font(size=10)
         self.icon_font = self.scaler.font(size=11, family="Segoe UI Emoji")
         self.emoji_images = load_emoji_images()
@@ -846,8 +993,9 @@ class FriendsWindow:
                 self._preload_group_recent(record)
         self._refresh_group_list()
 
-        threading.Thread(target=self._recv_loop, daemon=True).start()
+        self._start_recv_thread()
         self.root.after(100, self._poll_queue)
+        self.root.after(HEARTBEAT_INTERVAL_MS, self._heartbeat)
         self.root.deiconify()
         if broadcasts:
             self.root.after(300, self._show_broadcasts, list(broadcasts))
@@ -865,14 +1013,23 @@ class FriendsWindow:
             self._prompt_friend_request(record.get("from", ""))
 
     def _prompt_friend_request(self, requester: str) -> None:
-        accept = messagebox.askyesno("好友申请", f"{requester} 请求添加你为好友，是否同意？")
+        if not requester:
+            return
+        dialog = self.request_dialogs.get(requester)
+        if dialog is not None:
+            dialog.show()
+            return
+        self.request_dialogs[requester] = FriendRequestDialog(self.root, self, requester)
+
+    def respond_friend_request(self, requester: str, accept: bool) -> bool:
         try:
             send_msg(self.sock, {"type": "friend_response", "from": requester, "accept": accept})
         except OSError:
             messagebox.showerror("错误", "回复好友申请失败：与服务器的连接已断开")
-            return
+            return False
         if accept:
             self.add_friend(requester)
+        return True
 
     def _on_theme_change(self) -> None:
         self.theme_btn.configure(text=theme_icon())
@@ -883,6 +1040,53 @@ class FriendsWindow:
             count = self.unread.get(friend, 0)
             label = friend if count == 0 else f"{friend} ({count}条未读)"
             self.friend_list.insert("end", label)
+        self._update_unread_notices()
+
+    def _touch_unread(self, source: tuple) -> None:
+        if source in self._unread_order:
+            self._unread_order.remove(source)
+        self._unread_order.append(source)
+
+    def _unread_count(self, source: tuple) -> int:
+        kind, key = source
+        if kind == "friend":
+            return self.unread.get(key, 0) if key in self.friends else 0
+        return self.group_unread.get(key, 0) if key in self.groups else 0
+
+    def _unread_sources(self) -> list:
+        self._unread_order = [s for s in self._unread_order if self._unread_count(s) > 0]
+        return self._unread_order
+
+    def _source_name(self, source: tuple) -> str:
+        kind, key = source
+        return key if kind == "friend" else self.groups.get(key, {}).get("name", "群聊")
+
+    def _update_unread_notices(self) -> None:
+        """在已打开的聊天窗口顶部提示其他会话的未读消息。"""
+        sources = self._unread_sources()
+        if not sources:
+            text = ""
+        else:
+            total = sum(self._unread_count(s) for s in sources)
+            latest = self._source_name(sources[-1])
+            if len(sources) == 1:
+                text = f"{latest} 发来{total}条新消息 >"
+            else:
+                text = f"{latest} 等{len(sources)}个会话 {total}条新消息 >"
+        for chat in list(self.open_chats.values()) + list(self.open_group_chats.values()):
+            chat.set_unread_notice(text)
+
+    def jump_to_latest_unread(self, from_chat) -> None:
+        sources = self._unread_sources()
+        if not sources:
+            return
+        kind, key = sources[-1]
+        position = window_center(from_chat.root)
+        from_chat.dispose()
+        if kind == "friend":
+            self.open_chat_with(key, position)
+        else:
+            self.open_group_chat_with(key, position)
 
     def open_add_friend_dialog(self):
         if self.active_search_dialog is None:
@@ -926,10 +1130,18 @@ class FriendsWindow:
             return
         self.open_chat_with(self.friends[selection[0]])
 
-    def open_chat_with(self, friend: str):
+    def _place_chat(self, chat_win, position=None) -> None:
+        """聊天窗口与好友界面（或指定中心点）居中对齐打开。"""
+        if position is None and self.root.winfo_viewable():
+            position = window_center(self.root)
+        restore_window("chat", chat_win, position)
+
+    def open_chat_with(self, friend: str, position=None):
+        remember_window("friends", self.root)
         self.unread[friend] = 0
         self._refresh_friend_list()
         if friend in self.open_chats:
+            self._place_chat(self.open_chats[friend].root, position)
             self.open_chats[friend].root.deiconify()
             self.open_chats[friend].root.lift()
             self.open_chats[friend].root.focus_force()
@@ -938,11 +1150,16 @@ class FriendsWindow:
             chat = ChatWindow(chat_win, self, friend)
             self.open_chats[friend] = chat
             chat.refresh()
+            self._place_chat(chat_win, position)
             chat_win.deiconify()  # 先填完内容再显示，避免闪一下空聊天框
+        self._update_unread_notices()
+        self._apply_connection_status()
         self.root.withdraw()
 
-    def show_friends(self) -> None:
-        """从聊天窗口返回时重新显示好友列表窗口。"""
+    def show_friends(self, position=None) -> None:
+        """从聊天窗口返回时重新显示好友列表窗口，position 为聊天窗口的中心点。"""
+        if position is not None:
+            restore_window("friends", self.root, position)
         self.root.deiconify()
         self.root.lift()
         self.root.focus_force()
@@ -962,20 +1179,26 @@ class FriendsWindow:
             pass
 
     def send_payload(self, friend: str, payload: dict, encrypted: bool = True):
-        """发送文字/表情/文件负载：默认整体 JSON 序列化后加密；@AI 消息按 encrypted=False 明文发送。"""
+        """发送文字/表情/文件负载：默认整体 JSON 序列化后加密；@AI 消息按 encrypted=False 明文发送。
+
+        断线期间也先记入"发送中"，重连成功后自动补发，不会丢。
+        """
         msg_id = str(uuid.uuid4())
         plaintext_json = json.dumps(payload, ensure_ascii=False)
         ciphertext = encrypt_text(plaintext_json, CHAT_PASSPHRASE) if encrypted else plaintext_json
-        try:
-            send_msg(self.sock, {
-                "type": "msg", "msg_id": msg_id, "to": friend,
-                "ciphertext": ciphertext, "encrypted": encrypted,
-            })
-        except OSError:
-            return None
+        wire = {
+            "type": "msg", "msg_id": msg_id, "to": friend,
+            "ciphertext": ciphertext, "encrypted": encrypted,
+        }
         self.pending_ids[msg_id] = friend
+        self.pending_wire[msg_id] = wire
         entry = {"direction": "out", "payload": payload, "status": "发送中...", "msg_id": msg_id}
         self.chat_logs.setdefault(friend, []).append(entry)
+        if self.connected:
+            try:
+                send_msg(self.sock, wire)
+            except OSError:
+                self._drop_connection()
         return entry
 
     def _decode_payload(self, record: dict) -> dict:
@@ -1000,16 +1223,121 @@ class FriendsWindow:
             pass
         return {"kind": "text", "text": plaintext}
 
-    def _recv_loop(self):
+    def _start_recv_thread(self) -> None:
+        self._sock_gen += 1
+        self._last_recv = time.monotonic()
+        threading.Thread(target=self._recv_loop, args=(self.sock, self._sock_gen), daemon=True).start()
+
+    def _recv_loop(self, sock, gen: int):
         while True:
             try:
-                data = recv_msg(self.sock)
+                data = recv_msg(sock)
             except OSError:
                 data = None
             if data is None:
-                self.incoming_queue.put({"type": "disconnected"})
+                self.incoming_queue.put({"type": "disconnected", "_gen": gen})
                 return
+            self._last_recv = time.monotonic()
+            data["_gen"] = gen
             self.incoming_queue.put(data)
+
+    def _heartbeat(self) -> None:
+        if self._closing:
+            return
+        if self.connected:
+            if self._server_pongs and time.monotonic() - self._last_recv > HEARTBEAT_TIMEOUT_SEC:
+                self._drop_connection()
+            else:
+                try:
+                    send_msg(self.sock, {"type": "ping"})
+                except OSError:
+                    self._drop_connection()
+        self.root.after(HEARTBEAT_INTERVAL_MS, self._heartbeat)
+
+    def _drop_connection(self) -> None:
+        """主动废弃当前连接（发送失败或心跳超时），进入自动重连。"""
+        if not self.connected:
+            return
+        try:
+            self.sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+        self._on_disconnected()
+
+    def _on_disconnected(self) -> None:
+        if not self.connected or self._closing:
+            return
+        self.connected = False
+        self._reconnect_attempt = 0
+        self._apply_connection_status()
+        self._schedule_reconnect()
+
+    def _schedule_reconnect(self) -> None:
+        if self.login_info is None:
+            messagebox.showwarning("提示", "与服务器的连接已断开")
+            return
+        delay = RECONNECT_DELAYS_SEC[min(self._reconnect_attempt, len(RECONNECT_DELAYS_SEC) - 1)]
+        self._reconnect_attempt += 1
+        self.root.after(delay * 1000, self._start_reconnect)
+
+    def _start_reconnect(self) -> None:
+        if self.connected or self._closing:
+            return
+        host, port, password = self.login_info
+        threading.Thread(
+            target=self._reconnect_worker, args=(host, port, password), daemon=True
+        ).start()
+
+    def _reconnect_worker(self, host, port, password) -> None:
+        try:
+            sock, response = connect_and_login(host, port, self.username, password)
+        except LoginError as exc:
+            self.incoming_queue.put({"type": "_reconnect_failed", "fatal": True, "reason": str(exc)})
+            return
+        except OSError as exc:
+            self.incoming_queue.put({"type": "_reconnect_failed", "fatal": False, "reason": str(exc)})
+            return
+        self.incoming_queue.put({"type": "_reconnected", "sock": sock, "response": response})
+
+    def _on_reconnected(self, sock, response: dict) -> None:
+        if self._closing:
+            sock.close()
+            return
+        self.sock = sock
+        self.connected = True
+        self._start_recv_thread()
+        self._apply_connection_status()
+
+        self.friends = list(response.get("friends", self.friends))
+        save_friends(self.username, self.friends)
+        self.groups = {g["id"]: g for g in response.get("groups", [])}
+        # 断线期间别人发来的消息，服务器会作为未送达记录在登录响应里补发
+        for record in sorted(response.get("history", []), key=lambda r: r["timestamp"]):
+            self._route_incoming(record)
+        for record in sorted(response.get("group_history", []), key=lambda r: r["timestamp"]):
+            self._route_group_incoming(record)
+        self._refresh_friend_list()
+        self._refresh_group_list()
+        for record in response.get("friend_requests", []):
+            if record.get("from") not in self.request_dialogs:
+                self._prompt_friend_request(record.get("from", ""))
+
+        for wire in list(self.pending_wire.values()):
+            try:
+                send_msg(self.sock, wire)
+            except OSError:
+                self._drop_connection()
+                return
+
+    def _apply_connection_status(self) -> None:
+        suffix = "" if self.connected else DISCONNECTED_SUFFIX
+        self.root.title(self.base_title + suffix)
+        for chat in list(self.open_chats.values()) + list(self.open_group_chats.values()):
+            chat.root.title(chat.base_title + suffix)
 
     def _poll_queue(self):
         try:
@@ -1030,6 +1358,8 @@ class FriendsWindow:
                 chat.show_typing(bool(data.get("state")))
         elif msg_type == "msg_ack":
             self._route_ack(data)
+        elif msg_type == "group_msg_ack":
+            self._route_group_ack(data)
         elif msg_type == "search_result":
             if self.active_search_dialog is not None:
                 self.active_search_dialog.show_results(data.get("users", []))
@@ -1060,7 +1390,24 @@ class FriendsWindow:
                 self._refresh_friend_list()
             messagebox.showinfo("提示", f"{friend} 已将你从好友中移除")
         elif msg_type == "disconnected":
-            messagebox.showwarning("提示", "与服务器的连接已断开")
+            if data.get("_gen") == self._sock_gen:
+                self._on_disconnected()
+        elif msg_type == "pong":
+            self._server_pongs = True
+        elif msg_type == "kicked":
+            if data.get("_gen") != self._sock_gen:
+                return  # 自己重连时顶掉的是本客户端的旧连接，不算被别人顶号
+            self._closing = True  # 账号在别处登录，不能自动重连，否则两边会互相顶号
+            self.connected = False
+            self.root.title(self.base_title + "（已离线）")
+            messagebox.showwarning("提示", "你的账号已在其他地方登录，本客户端已离线")
+        elif msg_type == "_reconnected":
+            self._on_reconnected(data["sock"], data["response"])
+        elif msg_type == "_reconnect_failed":
+            if data.get("fatal"):
+                messagebox.showerror("重连失败", f"自动重连被服务器拒绝：{data.get('reason', '')}\n请重新启动客户端登录")
+            else:
+                self._schedule_reconnect()
 
     def _route_incoming(self, record: dict) -> None:
         is_ai = record["from"] == AI_SENDER
@@ -1078,7 +1425,11 @@ class FriendsWindow:
                 flash_window(chat.root)
         else:
             self.unread[friend] = self.unread.get(friend, 0) + 1
+            self._touch_unread(("friend", friend))
             flash_window(self.root)
+            for other in list(self.open_chats.values()) + list(self.open_group_chats.values()):
+                if not other.is_focused:
+                    flash_window(other.root)
         self._refresh_friend_list()
 
     def _preload_recent(self, record: dict) -> None:
@@ -1101,6 +1452,7 @@ class FriendsWindow:
 
     def _route_ack(self, data: dict) -> None:
         msg_id = data.get("msg_id")
+        self.pending_wire.pop(msg_id, None)
         friend = self.pending_ids.pop(msg_id, None)
         if friend is None:
             return
@@ -1132,6 +1484,7 @@ class FriendsWindow:
             count = self.group_unread.get(group_id, 0)
             label = group["name"] if count == 0 else f'{group["name"]} ({count}条未读)'
             self.group_list.insert("end", label)
+        self._update_unread_notices()
 
     def open_create_group_dialog(self) -> None:
         if not self.friends:
@@ -1145,10 +1498,12 @@ class FriendsWindow:
             return
         self.open_group_chat_with(self._group_order[selection[0]])
 
-    def open_group_chat_with(self, group_id: str) -> None:
+    def open_group_chat_with(self, group_id: str, position=None) -> None:
+        remember_window("friends", self.root)
         self.group_unread[group_id] = 0
         self._refresh_group_list()
         if group_id in self.open_group_chats:
+            self._place_chat(self.open_group_chats[group_id].root, position)
             self.open_group_chats[group_id].root.deiconify()
             self.open_group_chats[group_id].root.lift()
             self.open_group_chats[group_id].root.focus_force()
@@ -1157,7 +1512,10 @@ class FriendsWindow:
             chat = GroupChatWindow(chat_win, self, group_id)
             self.open_group_chats[group_id] = chat
             chat.refresh()
+            self._place_chat(chat_win, position)
             chat_win.deiconify()
+        self._update_unread_notices()
+        self._apply_connection_status()
         self.root.withdraw()
 
     def request_create_group(self, name: str, members: list) -> None:
@@ -1178,28 +1536,51 @@ class FriendsWindow:
         except OSError:
             pass
         chat = self.open_group_chats.pop(group_id, None)
+        position = None
         if chat:
+            position = window_center(chat.root)
             chat.root.destroy()
         self.groups.pop(group_id, None)
         self.group_unread.pop(group_id, None)
         self._refresh_group_list()
-        self.show_friends()
+        self.show_friends(position)
 
     def send_group_payload(self, group_id: str, payload: dict):
-        """群聊消息复用私聊同一套加密口令，服务器只负责按成员名单转发不解密。"""
+        """群聊消息复用私聊同一套加密口令，服务器只负责按成员名单转发不解密。
+
+        和私聊一样先记为"发送中"，等服务器 group_msg_ack 确认；断线期间的消息重连后自动补发。
+        """
         msg_id = str(uuid.uuid4())
         plaintext_json = json.dumps(payload, ensure_ascii=False)
         ciphertext = encrypt_text(plaintext_json, CHAT_PASSPHRASE)
-        try:
-            send_msg(self.sock, {
-                "type": "group_msg", "msg_id": msg_id, "group_id": group_id,
-                "ciphertext": ciphertext, "encrypted": True,
-            })
-        except OSError:
-            return None
-        entry = {"direction": "out", "from": self.username, "payload": payload}
+        wire = {
+            "type": "group_msg", "msg_id": msg_id, "group_id": group_id,
+            "ciphertext": ciphertext, "encrypted": True,
+        }
+        self.pending_group_ids[msg_id] = group_id
+        self.pending_wire[msg_id] = wire
+        entry = {"direction": "out", "from": self.username, "payload": payload, "status": "发送中...", "msg_id": msg_id}
         self.group_chat_logs.setdefault(group_id, []).append(entry)
+        if self.connected:
+            try:
+                send_msg(self.sock, wire)
+            except OSError:
+                self._drop_connection()
         return entry
+
+    def _route_group_ack(self, data: dict) -> None:
+        msg_id = data.get("msg_id")
+        self.pending_wire.pop(msg_id, None)
+        group_id = self.pending_group_ids.pop(msg_id, None)
+        if group_id is None:
+            return
+        status_text = "已发送" if data.get("status") == "sent" else "发送失败(你已不在该群)"
+        for entry in self.group_chat_logs.get(group_id, []):
+            if entry.get("msg_id") == msg_id:
+                entry["status"] = status_text
+                break
+        if group_id in self.open_group_chats:
+            self.open_group_chats[group_id].refresh()
 
     def _on_group_created(self, data: dict) -> None:
         group = {k: v for k, v in data.items() if k != "type"}
@@ -1228,7 +1609,11 @@ class FriendsWindow:
         else:
             if notify:
                 self.group_unread[group_id] = self.group_unread.get(group_id, 0) + 1
+                self._touch_unread(("group", group_id))
                 flash_window(self.root)
+                for other in list(self.open_chats.values()) + list(self.open_group_chats.values()):
+                    if not other.is_focused:
+                        flash_window(other.root)
         self._refresh_group_list()
 
     def _preload_group_recent(self, record: dict) -> None:
@@ -1241,6 +1626,8 @@ class FriendsWindow:
         self.group_chat_logs.setdefault(group_id, []).append(entry)
 
     def on_close(self):
+        self._closing = True
+        remember_window("friends", self.root)
         try:
             self.sock.close()
         except OSError:
@@ -1310,6 +1697,48 @@ class AddFriendDialog:
     def close(self):
         if self.friends_window.active_search_dialog is self:
             self.friends_window.active_search_dialog = None
+        self.win.destroy()
+
+
+class FriendRequestDialog:
+    """非模态的好友申请提醒。客户端在后台时系统不允许抢焦点，所以用置顶+任务栏闪烁保证对方能看到；
+    直接关闭视为稍后处理，申请仍保留在服务器，下次登录会再次提醒。"""
+
+    def __init__(self, parent, friends_window: FriendsWindow, requester: str):
+        self.friends_window = friends_window
+        self.requester = requester
+
+        self.win = tk.Toplevel(parent)
+        hide_until_ready(self.win)
+        self.win.title("好友申请")
+        self.win.protocol("WM_DELETE_WINDOW", self.close)
+        apply_theme(self.win)
+        register_themed_window(self.win)
+
+        frame = ttk.Frame(self.win, padding=12)
+        frame.pack(fill="both", expand=True)
+        ttk.Label(frame, text=f"{requester} 请求添加你为好友，是否同意？", wraplength=240).pack(fill="x", pady=(0, 12))
+        btn_frame = ttk.Frame(frame)
+        btn_frame.pack(fill="x")
+        dark_button(btn_frame, text="同意", command=lambda: self.respond(True)).pack(side="left", fill="x", expand=True, padx=(0, 4))
+        dark_button(btn_frame, text="拒绝", command=lambda: self.respond(False)).pack(side="left", fill="x", expand=True)
+
+        center_window(self.win, 280, 120)
+        self.win.attributes("-topmost", True)
+        self.win.deiconify()
+        self.show()
+
+    def show(self) -> None:
+        self.win.deiconify()
+        self.win.lift()
+        self.win.after(100, lambda: flash_window(self.win))
+
+    def respond(self, accept: bool) -> None:
+        if self.friends_window.respond_friend_request(self.requester, accept):
+            self.close()
+
+    def close(self) -> None:
+        self.friends_window.request_dialogs.pop(self.requester, None)
         self.win.destroy()
 
 
@@ -1488,7 +1917,23 @@ class ImageViewer:
             messagebox.showerror("错误", f"保存失败: {exc}")
 
 
-class ChatWindow:
+class _UnreadNoticeMixin:
+    """聊天窗口顶部的"其他会话新消息"提示，点击跳转到最近来消息的会话。"""
+
+    def _build_unread_notice(self, top_bar) -> None:
+        self.notice_font = self.scaler.font(size=9)
+        self.notice_font.configure(underline=True)
+        self.notice_label = ttk.Label(
+            top_bar, text="", font=self.notice_font, foreground=THEME.hint, cursor="hand2",
+        )
+        self.notice_label.pack(side="right", padx=6)
+        self.notice_label.bind("<Button-1>", lambda event: self.friends_window.jump_to_latest_unread(self))
+
+    def set_unread_notice(self, text: str) -> None:
+        self.notice_label.configure(text=text)
+
+
+class ChatWindow(_UnreadNoticeMixin):
     """单个好友的聊天窗口：文字/表情/文件/图片，支持 Ctrl+V 直接粘贴剪贴板图片发送。"""
 
     def __init__(self, root, friends_window: FriendsWindow, friend: str):
@@ -1496,6 +1941,7 @@ class ChatWindow:
         self.friends_window = friends_window
         self.friend = friend
         self._image_refs = []  # 防止内嵌图片被垃圾回收
+        self._emoji_picker = None
         self._typing_sent_at = 0.0
         self._typing_stop_job = None
         self._typing_hide_job = None
@@ -1504,7 +1950,8 @@ class ChatWindow:
         root.bind("<FocusOut>", self._on_focus_out, add="+")
 
         hide_until_ready(root)
-        root.title(f"与 {friend} 聊天")
+        self.base_title = f"与 {friend} 聊天"
+        root.title(self.base_title)
         root.protocol("WM_DELETE_WINDOW", self.on_close)
         apply_theme(root)
         register_themed_window(root, self._on_theme_change)
@@ -1526,6 +1973,7 @@ class ChatWindow:
         self.typing_label.pack(side="left")
         self.theme_btn = dark_button(top_bar, text=theme_icon(), command=toggle_theme, font=self.emoji_font)
         self.theme_btn.pack(side="right")
+        self._build_unread_notice(top_bar)
 
         # 输入栏先占位，否则窗口缩小时会被可伸缩的聊天区挤没
         input_frame = ttk.Frame(main)
@@ -1571,6 +2019,7 @@ class ChatWindow:
     def _on_theme_change(self) -> None:
         self.theme_btn.configure(text=theme_icon())
         self.typing_label.configure(foreground=THEME.hint)
+        self.notice_label.configure(foreground=THEME.hint)
         self.chat_box.frame.configure(bg=THEME.panel)
         self.chat_box.tag_configure("left", foreground=THEME.fg)
         self.chat_box.tag_configure("right", foreground=THEME.fg)
@@ -1616,7 +2065,9 @@ class ChatWindow:
             pass
 
     def open_emoji_picker(self):
-        EmojiPicker(self.root, self.friends_window.emoji_images, self.insert_emoji)
+        if self._emoji_picker is not None and self._emoji_picker.win.winfo_exists():
+            return
+        self._emoji_picker = EmojiPicker(self.root, self.friends_window.emoji_images, self.insert_emoji)
 
     def insert_emoji(self, emoji: str) -> None:
         self.msg_entry.insert(tk.INSERT, emoji)
@@ -1772,15 +2223,20 @@ class ChatWindow:
             return "break"
         return None
 
-    def on_close(self):
+    def dispose(self):
         self._stop_typing()
         self._cancel_job("_typing_hide_job")
         self.friends_window.open_chats.pop(self.friend, None)
-        self.friends_window.show_friends()
+        remember_window("chat", self.root)
         self.root.destroy()
 
+    def on_close(self):
+        position = window_center(self.root)
+        self.dispose()
+        self.friends_window.show_friends(position)
 
-class GroupChatWindow:
+
+class GroupChatWindow(_UnreadNoticeMixin):
     """群聊窗口：结构与 ChatWindow 类似，区别是发送人不固定，需按消息自带的 from 字段左右对齐。"""
 
     def __init__(self, root, friends_window: FriendsWindow, group_id: str):
@@ -1788,6 +2244,7 @@ class GroupChatWindow:
         self.friends_window = friends_window
         self.group_id = group_id
         self._image_refs = []  # 防止内嵌图片被垃圾回收
+        self._emoji_picker = None
         self.is_focused = True
         root.bind("<FocusIn>", self._on_focus_in, add="+")
         root.bind("<FocusOut>", self._on_focus_out, add="+")
@@ -1795,7 +2252,8 @@ class GroupChatWindow:
         group_name = friends_window.groups.get(group_id, {}).get("name", "群聊")
 
         hide_until_ready(root)
-        root.title(f"群聊 - {group_name}")
+        self.base_title = f"群聊 - {group_name}"
+        root.title(self.base_title)
         root.protocol("WM_DELETE_WINDOW", self.on_close)
         apply_theme(root)
         register_themed_window(root, self._on_theme_change)
@@ -1817,6 +2275,7 @@ class GroupChatWindow:
         members_btn.pack(side="left", padx=4)
         self.theme_btn = dark_button(top_bar, text=theme_icon(), command=toggle_theme, font=self.emoji_font)
         self.theme_btn.pack(side="right")
+        self._build_unread_notice(top_bar)
 
         input_frame = ttk.Frame(main)
         input_frame.pack(side="bottom", fill="x")
@@ -1858,6 +2317,7 @@ class GroupChatWindow:
 
     def _on_theme_change(self) -> None:
         self.theme_btn.configure(text=theme_icon())
+        self.notice_label.configure(foreground=THEME.hint)
         self.chat_box.frame.configure(bg=THEME.panel)
         self.chat_box.tag_configure("left", foreground=THEME.fg)
         self.chat_box.tag_configure("right", foreground=THEME.fg)
@@ -1867,7 +2327,9 @@ class GroupChatWindow:
         GroupMembersDialog(self.root, self.friends_window, self.group_id)
 
     def open_emoji_picker(self):
-        EmojiPicker(self.root, self.friends_window.emoji_images, self.insert_emoji)
+        if self._emoji_picker is not None and self._emoji_picker.win.winfo_exists():
+            return
+        self._emoji_picker = EmojiPicker(self.root, self.friends_window.emoji_images, self.insert_emoji)
 
     def insert_emoji(self, emoji: str) -> None:
         self.msg_entry.insert(tk.INSERT, emoji)
@@ -1893,6 +2355,8 @@ class GroupChatWindow:
             self._render_file(payload, tag)
         else:
             self._render_text(payload.get("text", ""), tag)
+        if is_out and entry.get("status"):
+            self.chat_box.insert("end", f' ({entry["status"]})', (tag,))
         self.chat_box.insert("end", "\n", (tag,))
 
     def _render_text(self, text: str, align: str) -> None:
@@ -2013,10 +2477,15 @@ class GroupChatWindow:
             return "break"
         return None
 
-    def on_close(self):
+    def dispose(self):
         self.friends_window.open_group_chats.pop(self.group_id, None)
-        self.friends_window.show_friends()
+        remember_window("chat", self.root)
         self.root.destroy()
+
+    def on_close(self):
+        position = window_center(self.root)
+        self.dispose()
+        self.friends_window.show_friends(position)
 
 
 if __name__ == "__main__":
